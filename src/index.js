@@ -145,7 +145,6 @@ class Chain extends Duplex {
     if (!options || !options.skipEvents) {
       this.streams.forEach(stream => stream.on('error', error => {
         this.destroy(error);
-        this.streams.forEach(deadStream => deadStream.destroy(error));
       }));
     }
   }
@@ -167,6 +166,16 @@ class Chain extends Duplex {
   }
   _read() {
     this.output.resume();
+  }
+  _destroy(error, callback) {
+    let error_ = null;
+    try {
+    this.streams.forEach(deadStream => deadStream.destroy(error));
+  } catch (e) {
+    error = e;
+  }
+
+  callback(error || error_);
   }
   static make(fns, options) {
     return new Chain(fns, options);
