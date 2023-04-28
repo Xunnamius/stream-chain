@@ -1,204 +1,206 @@
 'use strict';
 
-const {Duplex} = require('stream');
-const defs = require('./defs');
-const gen = require('./gen');
-const asStream = require('./asStream');
+const {Readable, Writable, Duplex, Transform} = require('stream');
+
+const none = Symbol.for('object-stream.none');
+const finalSymbol = Symbol.for('object-stream.final');
+const manySymbol = Symbol.for('object-stream.many');
+
+const final = value => ({[finalSymbol]: value});
+const many = values => ({[manySymbol]: values});
+
+const isFinal = o => o && typeof o == 'object' && finalSymbol in o;
+const isMany = o => o && typeof o == 'object' && manySymbol in o;
+
+const getFinalValue = o => o[finalSymbol];
+const getManyValues = o => o[manySymbol];
+
+const runAsyncGenerator = async (gen, stream) => {
+  for (;;) {
+    let data = gen.next();
+    if (data && typeof data.then == 'function') {
+      data = await data;
+    }
+    if (data.done) break;
+    let value = data.value;
+    if (value && typeof value.then == 'function') {
+      value = await value;
+    }
+    Chain.sanitize(value, stream);
+  }
+};
+
+const wrapFunction = fn =>
+  new Transform({
+    writableObjectMode: true,
+    readableObjectMode: true,
+    transform(chunk, encoding, callback) {
+      try {
+        const result = fn.call(this, chunk, encoding);
+        if (result && typeof result.then == 'function') {
+          // thenable
+          result.then(
+            result => (Chain.sanitize(result, this), callback(null)),
+            error => callback(error)
+          );
+          return;
+        }
+        if (result && typeof result.next == 'function') {
+          // generator
+          runAsyncGenerator(result, this).then(
+            () => callback(null),
+            error => callback(error)
+          );
+          return;
+        }
+        Chain.sanitize(result, this);
+        callback(null);
+      } catch (error) {
+        callback(error);
+      }
+    }
+  });
+
+const wrapArray = fns =>
+  new Transform({
+    writableObjectMode: true,
+    readableObjectMode: true,
+    transform(chunk, encoding, callback) {
+      try {
+        let value = chunk;
+        for (let i = 0; i < fns.length; ++i) {
+          const result = fns[i].call(this, value, encoding);
+          if (result === Chain.none) {
+            callback(null);
+            return;
+          }
+          if (Chain.isFinal(result)) {
+            value = Chain.getFinalValue(result);
+            break;
+          }
+          value = result;
+        }
+        Chain.sanitize(value, this);
+        callback(null);
+      } catch (error) {
+        callback(error);
+      }
+    }
+  });
 
 // is*NodeStream functions taken from https://github.com/nodejs/node/blob/master/lib/internal/streams/utils.js
 const isReadableNodeStream = obj =>
   obj &&
   typeof obj.pipe === 'function' &&
   typeof obj.on === 'function' &&
-  (!obj._writableState ||
-    (typeof obj._readableState === 'object' ? obj._readableState.readable : null) !== false) && // Duplex
+  (!obj._writableState || (typeof obj._readableState === 'object' ? obj._readableState.readable : null) !== false) && // Duplex
   (!obj._writableState || obj._readableState); // Writable has .pipe.
 
 const isWritableNodeStream = obj =>
   obj &&
   typeof obj.write === 'function' &&
   typeof obj.on === 'function' &&
-  (!obj._readableState ||
-    (typeof obj._writableState === 'object' ? obj._writableState.writable : null) !== false); // Duplex
+  (!obj._readableState || (typeof obj._writableState === 'object' ? obj._writableState.writable : null) !== false); // Duplex
 
 const isDuplexNodeStream = obj =>
-  obj &&
-  typeof obj.pipe === 'function' &&
-  obj._readableState &&
-  typeof obj.on === 'function' &&
-  typeof obj.write === 'function';
+  obj && typeof obj.pipe === 'function' && obj._readableState && typeof obj.on === 'function' && typeof obj.write === 'function';
 
-const groupFunctions = (output, fn, index, fns) => {
-  if (
-    isDuplexNodeStream(fn) ||
-    (!index && isReadableNodeStream(fn)) ||
-    (index === fns.length - 1 && isWritableNodeStream(fn))
-  ) {
-    output.push(fn);
-    return output;
+class Chain extends Duplex {
+  constructor(fns, options) {
+    super(options || {writableObjectMode: true, readableObjectMode: true});
+
+    if (!(fns instanceof Array) || !fns.length) {
+      throw Error("Chain's argument should be a non-empty array.");
+    }
+
+    this.streams = fns
+      .filter(fn => fn)
+      .map((fn, index, fns) => {
+        if (typeof fn === 'function' || fn instanceof Array) return Chain.convertToTransform(fn);
+        if (isDuplexNodeStream(fn) || (!index && isReadableNodeStream(fn)) || (index === fns.length - 1 && isWritableNodeStream(fn))) {
+          return fn;
+        }
+        throw Error('Arguments should be functions, arrays or streams.');
+      })
+      .filter(s => s);
+    this.input = this.streams[0];
+    this.output = this.streams.reduce((output, stream) => (output && output.pipe(stream)) || stream);
+
+    if (!isWritableNodeStream(this.input)) {
+      this._write = (_1, _2, callback) => callback(null);
+      this._final = callback => callback(null); // unavailable in Node 6
+      this.input.on('end', () => this.end());
+    }
+
+    if (isReadableNodeStream(this.output)) {
+      this.output.on('data', chunk => !this.push(chunk) && this.output.pause());
+      this.output.on('end', () => this.push(null));
+    } else {
+      this._read = () => {}; // nop
+      this.resume();
+      this.output.on('finish', () => this.push(null));
+    }
+
+    // connect events
+    if (!options || !options.skipEvents) {
+      this.streams.forEach(stream => stream.on('error', error => {
+        this.destroy(error);
+        this.streams.forEach(deadStream => deadStream.destroy(error));
+      }));
+    }
   }
-  if (typeof fn != 'function')
-    throw TypeError('Item #' + index + ' is not a proper stream, nor a function.');
-  if (!output.length) output.push([]);
-  const last = output[output.length - 1];
-  if (Array.isArray(last)) {
-    last.push(fn);
-  } else {
-    output.push([fn]);
+  _write(chunk, encoding, callback) {
+    let error = null;
+    try {
+      this.input.write(chunk, encoding, e => callback(e || error));
+    } catch (e) {
+      error = e;
+    }
   }
-  return output;
-};
-
-const produceStreams = item => {
-  if (Array.isArray(item)) {
-    if (!item.length) return null;
-    if (item.length == 1) return item[0] && chain.asStream(item[0]);
-    return chain.asStream(chain.gen(...item));
+  _final(callback) {
+    let error = null;
+    try {
+      this.input.end(null, null, e => callback(e || error));
+    } catch (e) {
+      error = e;
+    }
   }
-  return item;
-};
-
-const wrapFunctions = (fn, index, fns) => {
-  if (
-    isDuplexNodeStream(fn) ||
-    (!index && isReadableNodeStream(fn)) ||
-    (index === fns.length - 1 && isWritableNodeStream(fn))
-  ) {
-    return fn; // an acceptable stream
+  _read() {
+    this.output.resume();
   }
-  if (typeof fn == 'function') return chain.asStream(fn); // a function
-  throw TypeError('Item #' + index + ' is not a proper stream, nor a function.');
-};
-
-// default implementation of required stream methods
-
-const write = (input, chunk, encoding, callback) => {
-  let error = null;
-  try {
-    input.write(chunk, encoding, e => callback(e || error));
-  } catch (e) {
-    error = e;
+  static make(fns, options) {
+    return new Chain(fns, options);
   }
-};
-
-const final = (input, callback) => {
-  let error = null;
-  try {
-    input.end(null, null, e => callback(e || error));
-  } catch (e) {
-    error = e;
+  static sanitize(result, stream) {
+    if (Chain.isFinal(result)) {
+      result = Chain.getFinalValue(result);
+    } else if (Chain.isMany(result)) {
+      result = Chain.getManyValues(result);
+    }
+    if (result !== undefined && result !== null && result !== Chain.none) {
+      if (result instanceof Array) {
+        result.forEach(value => value !== undefined && value !== null && stream.push(value));
+      } else {
+        stream.push(result);
+      }
+    }
   }
-};
-
-const read = output => {
-  output.resume();
-};
-
-// the chain creator
-
-const chain = (fns, options) => {
-  if (!Array.isArray(fns) || !fns.length) {
-    throw TypeError("Chain's first argument should be a non-empty array.");
+  static convertToTransform(fn) {
+    if (typeof fn === 'function') return wrapFunction(fn);
+    if (fn instanceof Array) return fn.length ? wrapArray(fn) : null;
+    return null;
   }
+}
 
-  fns = fns.flat(Infinity).filter(fn => fn);
+Chain.none = none;
+Chain.final = final;
+Chain.isFinal = isFinal;
+Chain.getFinalValue = getFinalValue;
+Chain.many = many;
+Chain.isMany = isMany;
+Chain.getManyValues = getManyValues;
 
-  const streams = (
-      options && options.noGrouping
-        ? fns.map(wrapFunctions)
-        : fns
-            .map(fn => (defs.isFunctionList(fn) ? defs.getFunctionList(fn) : fn))
-            .flat(Infinity)
-            .reduce(groupFunctions, [])
-            .map(produceStreams)
-    ).filter(s => s),
-    input = streams[0],
-    output = streams.reduce((output, item) => (output && output.pipe(item)) || item);
+Chain.chain = Chain.make;
+Chain.make.Constructor = Chain;
 
-  let stream = null; // will be assigned later
-
-  let writeMethod = (chunk, encoding, callback) => write(input, chunk, encoding, callback),
-    finalMethod = callback => final(input, callback),
-    readMethod = () => read(output);
-
-  if (!isWritableNodeStream(input)) {
-    writeMethod = (_1, _2, callback) => callback(null);
-    finalMethod = callback => callback(null);
-    input.on('end', () => stream.end());
-  }
-
-  if (isReadableNodeStream(output)) {
-    output.on('data', chunk => !stream.push(chunk) && output.pause());
-    output.on('end', () => stream.push(null));
-  } else {
-    readMethod = () => {}; // nop
-    output.on('finish', () => stream.push(null));
-  }
-
-  stream = new Duplex(
-    Object.assign({writableObjectMode: true, readableObjectMode: true}, options, {
-      readable: isReadableNodeStream(output),
-      writable: isWritableNodeStream(input),
-      write: writeMethod,
-      final: finalMethod,
-      read: readMethod
-    })
-  );
-  stream.streams = streams;
-  stream.input = input;
-  stream.output = output;
-
-  if (!isReadableNodeStream(output)) {
-    stream.resume();
-  }
-
-  // connect events
-  if (!options || !options.skipEvents) {
-    streams.forEach(item => item.on('error', error => stream.emit('error', error)));
-  }
-
-  return stream;
-};
-
-const dataSource = fn => {
-  if (typeof fn == 'function') return fn;
-  if (fn) {
-    if (typeof fn[Symbol.asyncIterator] == 'function') return fn[Symbol.asyncIterator].bind(fn);
-    if (typeof fn[Symbol.iterator] == 'function') return fn[Symbol.iterator].bind(fn);
-  }
-  throw new TypeError('The argument should be a function or an iterable object.');
-};
-
-module.exports = chain;
-
-// from defs.js
-module.exports.none = defs.none;
-module.exports.stop = defs.stop;
-module.exports.Stop = defs.Stop;
-
-module.exports.finalSymbol = defs.finalSymbol;
-module.exports.finalValue = defs.finalValue;
-module.exports.final = defs.final;
-module.exports.isFinalValue = defs.isFinalValue;
-module.exports.getFinalValue = defs.getFinalValue;
-
-module.exports.manySymbol = defs.manySymbol;
-module.exports.many = defs.many;
-module.exports.isMany = defs.isMany;
-module.exports.getManyValues = defs.getManyValues;
-module.exports.getFunctionList = defs.getFunctionList;
-
-module.exports.flushSymbol = defs.flushSymbol;
-module.exports.flushable = defs.flushable;
-module.exports.isFlushable = defs.isFlushable;
-
-module.exports.fListSymbol = defs.fListSymbol;
-module.exports.isFunctionList = defs.isFunctionList;
-module.exports.getFunctionList = defs.getFunctionList;
-module.exports.setFunctionList = defs.setFunctionList;
-
-module.exports.chain = chain; // for compatibility with 2.x
-module.exports.gen = gen;
-module.exports.asStream = asStream;
-
-module.exports.dataSource = dataSource;
+module.exports = Chain;
